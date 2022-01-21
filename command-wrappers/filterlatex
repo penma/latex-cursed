@@ -68,6 +68,33 @@ sub current_closing_delim {
 	die("Unable to determine closing delimiter for entry \"$file_stack[0]->{str}\",matched=$file_stack[0]->{matched}");
 }
 
+# Enforces that the top of the stack contains only matched filenames.
+# This should be called when encountering '(' or "\n", both of which are
+# unlikely to occur in actual filenames, and usually terminate actual filenames.
+# But if what came before wasn't actually a filename, we should output it as
+# soon as possible and not keep it on the stack (otherwise, it sticks around for
+# too long, and eventually gets output, but in the wrong order)
+# test case: { dummy (foo xyz) abc
+sub enforce_topstack_matched {
+	my $out_mismatched = "";
+	while (@file_stack and !$file_stack[0]->{matched}) {
+		my $cand_fn = substr $file_stack[0]->{str}, 1;
+		$cand_fn =~ s/\012//g;
+		if (-f $cand_fn) {
+			# this actually was a filename
+			filter_filename_output($cand_fn, $file_stack[0]->{str});
+			# the closing delimiter likely appears at whatever later point in the stream
+			# so do not take the output off ... yet
+			$file_stack[0]->{matched} = 1;
+		} else {
+			# not a filename!
+			$out_mismatched = $file_stack[0]->{str} . $out_mismatched;
+			shift @file_stack;
+		}
+	}
+	output_mismatched($out_mismatched);
+}
+
 sub filter_filename_output {
 	my ($fn, $origstring) = @_;
 	my $mode = FN_NORMAL;
@@ -196,6 +223,13 @@ sub eat {
 			}
 		} elsif ($c =~ /$opening_delims/) {
 			# maybe another nested filename
+			# if there are any stack elements that are not yet matched,
+			# output and remove them (they're bogus). otherwise,
+			# they'll linger around, and get lost or output in
+			# wrong order.
+			# test case: { dummy (foo xyz) abc
+			enforce_topstack_matched();
+
 			unshift @file_stack, { str => $c, matched => 0 };
 		} elsif ($file_stack[0]->{matched}) {
 			# already matched, just keep outputting
@@ -208,21 +242,8 @@ sub eat {
 			$file_stack[0]->{str} .= $c;
 		} elsif ($c eq "\n") {
 			# not linewrap - what we got now has to be a filename, if it's not then it's a spurious match
-			my $cand_fn = substr $file_stack[0]->{str}, 1;
-			$cand_fn =~ s/\012//g;
-			if (-f $cand_fn) {
-				# this actually was a filename
-				filter_filename_output($cand_fn, "$file_stack[0]->{str}$c");
-				# the closing delimiter likely appears at whatever later point in the stream
-				# so do not take the output off ... yet
-				$file_stack[0]->{matched} = 1;
-			} else {
-				# not a filename!
-				output_mismatched("$file_stack[0]->{str}$c");
-				shift @file_stack;
-				# keep going with the next line, which we just started
-				$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
-			}
+			$file_stack[0]->{str} .= $c;
+			enforce_topstack_matched();
 		} else {
 			# any other char, just add it
 			$file_stack[0]->{str} .= $c;

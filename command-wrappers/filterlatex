@@ -51,7 +51,7 @@ my $wrapcol = 79; # TeX normally places no more than this many characters on inf
 my $opening_delims = qr/[\(<\{]/;
 
 sub flush_stack {
-	print STDERR join("", @file_stack);
+	print STDERR join("", map { $_->{str} } @file_stack);
 	@file_stack = ();
 	$state = ST_OUTER;
 }

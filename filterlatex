@@ -1,14 +1,29 @@
 #!/usr/bin/env perl
+# Attempts to filter most of the useless LaTeX output, in particular, endless
+# lists of loaded packages and font files.
+#
+# Invoke as:
+#   filterlatex pdflatex ...
+# or
+#   latexmk -pdf -pdflatex="filterlatex pdflatex" ...
+#
+# Unlike many other scripts with a similar purpose, this one:
+# - Still allows keyboard interaction with the latex process, e.g. on error
+#   prompts, or when using the unravel package
+# - Does not simply silence everything except for a tiny allowlist
+#
 # TODO:
 # - Improve parsing and allow for undoing 79-char linewrapping
 #   (It seems whenever output to the 79th column happens, a newline is always
 #   inserted after it, even if no 80th (non-newline) char follows)
 # - Improve identification of warnings in the output, so that more of them
-#   can be highlighted
+#   can be highlighted instead of just a fixed list
 # - Improve the way of tracking the files that are currently processed
 #   (Esp. that it doesn't get thrown off by spurious closing delimiters.
 #   I think it might be possible to tell if it was part of some other output,
 #   as long as one doesn't do \typeout{)} or so?)
+# - Translate syntax error output (spread over two lines) into single line
+#   with "^~~~~" string highlighting the current error position
 use strict;
 use warnings qw(all FATAL uninitialized);
 use 5.026;

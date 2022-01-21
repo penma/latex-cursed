@@ -1,0 +1,285 @@
+#!/usr/bin/env perl
+# TODO:
+# - Improve parsing and allow for undoing 79-char linewrapping
+#   (It seems whenever output to the 79th column happens, a newline is always
+#   inserted after it, even if no 80th (non-newline) char follows)
+# - Improve identification of warnings in the output, so that more of them
+#   can be highlighted
+# - Improve the way of tracking the files that are currently processed
+#   (Esp. that it doesn't get thrown off by spurious closing delimiters.
+#   I think it might be possible to tell if it was part of some other output,
+#   as long as one doesn't do \typeout{)} or so?)
+use strict;
+use warnings qw(all FATAL uninitialized);
+use 5.026;
+
+use IO::Pty::Easy;
+use IO::Select;
+
+# the state machine that eats pdflatex output one character at a time, and
+# produces filtered output
+
+use constant {
+	ST_OUTER => 0,
+	ST_IN_PARENS => 1,
+	ST_IGNORE_LINE => 2,
+
+	FN_HIDE => 0,
+	FN_NORMAL => 1,
+	FN_SHADED => 2,
+};
+
+my @file_stack;
+my $state = ST_OUTER;
+my $column = 1;
+my $wrapcol = 79; # TeX normally places no more than this many characters on info line, in "column 80" is the linebreak
+my $opening_delims = qr/[\(<\{]/;
+
+sub flush_stack {
+	print STDERR join("", @file_stack);
+	@file_stack = ();
+	$state = ST_OUTER;
+}
+
+sub current_closing_delim {
+	if (!@file_stack) {
+		die("Asked for closing delimiter, but nothing to be closed is on the stack");
+	}
+	my $first = substr($file_stack[0]->{str}, 0, 1);
+	return ")" if $first eq "(";
+	return ">" if $first eq "<";
+	return "}" if $first eq "{";
+	# otherwise ... how did it even end up here??
+	die("Unable to determine closing delimiter for entry \"$file_stack[0]->{str}\",matched=$file_stack[0]->{matched}");
+}
+
+sub filter_filename_output {
+	my ($fn, $origstring) = @_;
+	my $mode = FN_NORMAL;
+
+	if ($fn =~ m{^/usr/share/(?:texlive|texmf)/}) {
+		$mode = FN_HIDE;#FN_SHADED;
+	}
+
+	if ($mode == FN_HIDE) {
+		# nothing
+	} elsif ($mode == FN_NORMAL) {
+		output_regular($origstring);
+	} elsif ($mode == FN_SHADED) {
+		print STDERR "\e[38;2;128;128;128m";
+		output_regular($origstring);
+		print STDERR "\e[m";
+	} else {
+		die("Got invalid filter mode $mode for $fn");
+	}
+}
+
+my $last_out_line = "";
+my $this_out_line = "";
+
+#sub output_line_ignore { print STDERR "\e[48;2;80;0;0m$_[0]\e[m"; $this_out_line .= ""; }
+#sub output_mismatched  { print STDERR "\e[31m$_[0]\e[m"; $this_out_line .= ""; }
+sub output_line_ignore { my ($c) = @_; output_regular($c); }
+sub output_mismatched  { my ($c) = @_; output_regular($c); }
+
+sub output_highlighter {
+	if ($this_out_line =~ /(Underfull \\.box \(badness \d+\) has occurred|Overfull \\.box \([^\)]+\))$/) {
+		print STDERR sprintf("\e[%dD\e[1;31m%s\e[m", length($1), $1);
+	}
+}
+
+sub output_regular_ch {
+	my ($str) = @_;
+	if ($str ne "\n") {
+		# easy: simply output, and remember that we did write it
+		print STDERR $str;
+		$this_out_line .= $str;
+		output_highlighter();
+		return;
+	}
+
+	# had a newline. what do to?
+	if ($this_out_line !~ /\A\s*\z/) {
+		# if the current line actually had something, definitely output it
+		print STDERR $str;
+		$last_out_line = $this_out_line;
+		$this_out_line = "";
+	} elsif ($last_out_line !~ /\A\s*\z/) {
+		# this was a blank line, but the previous one was not blank, so we can emit the newline
+		print STDERR $str;
+		$last_out_line = "";
+		$this_out_line = "";
+	}
+
+	return;
+#	# do not output two consecutive linebreaks in a row
+#	if ($str eq "\n" and $last_out_line eq "") {
+#		# chomp
+#		$last_out_line = "";
+#	} else {
+#		if ($str eq "\n") { print STDERR "\e[1;31m\\n\e[m\n"; } elsif ($str eq "\r") { print STDERR "\e[1;31m\\r\e[m\n"; } else {
+#		print STDERR $str;
+#		$last_out = $str;
+#	}
+}
+sub output_regular { for my $c (split //, $_[0]) { output_regular_ch($c); } }
+
+
+sub eat {
+	my ($c) = @_;
+	# before anything else: track the column of original output in which the character appeared
+	my $last_column = $column;
+	$column = ($c eq "\012") ? 0 : $column + 1;
+
+	# TODO: we are probably always in ST_IN_PARENS because very early on, "(inputfile.tex" occurs
+	if ($state == ST_OUTER) {
+		if ($c =~ /$opening_delims/) {
+			# start of what could be a filename
+			# push it onto the stack and do not output it yet
+			if (@file_stack) {
+				die("Internal error: file_stack was supposed to be empty in ST_OUTER, but contained @file_stack");
+			}
+			$file_stack[0] = { str => $c, matched => 0 };
+			$state = ST_IN_PARENS;
+		} else {
+			# nothing special ...
+			output_regular($c);
+		}
+	} elsif ($state == ST_IN_PARENS) {
+		# keep scanning until either newline or ')'
+		if ($c eq current_closing_delim()) {
+			if ($file_stack[0]->{matched}) {
+				# already matched, just close it
+				shift @file_stack;
+				$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
+			} else {
+				my $cand_fn = substr $file_stack[0]->{str}, 1;
+				$cand_fn =~ s/\012//g;
+				# strip " loaded" from the end (xypic does that)
+				$cand_fn =~ s/ loaded$//;
+				if (-f $cand_fn) {
+					# this actually was a filename
+					filter_filename_output($cand_fn, "$file_stack[0]->{str}$c");
+					# remove from stack since it was closed
+					shift @file_stack;
+					$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
+				} else {
+					# not a filename!
+					my $mismatch = $file_stack[0]->{str} . $c;
+					output_mismatched($mismatch);
+					# remove from stack since it PROBABLY belongs to another open delimiter
+					# TODO: somewhat intelligently figure out if we're currently outputting a latex error that contain a source code excerpt (for which the "matching delimiter" assumption doesn't really hold)
+					shift @file_stack;
+					# recover by ignoring the rest of the current line
+					# ... unless the preceding stuff was something particular
+					if ($mismatch eq "(see the transcript file for additional information)") {
+						$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
+					} else {
+						$state = ST_IGNORE_LINE;
+					}
+				}
+			}
+		} elsif ($c =~ /$opening_delims/) {
+			# maybe another nested filename
+			unshift @file_stack, { str => $c, matched => 0 };
+		} elsif ($file_stack[0]->{matched}) {
+			# already matched, just keep outputting
+			output_regular($c); # XXX maybe just directly write?
+		} elsif ($c eq "\n" and $last_column == $wrapcol) {
+			# this might be either just wrapping, or the actual end
+			# of a filename that coincides with wraplen.
+			# but it seems like tex outputs a linebreak no matter what,
+			# i.e. if it's the actual end, then we get two newlines in a row
+			$file_stack[0]->{str} .= $c;
+		} elsif ($c eq "\n") {
+			# not linewrap - what we got now has to be a filename, if it's not then it's a spurious match
+			my $cand_fn = substr $file_stack[0]->{str}, 1;
+			$cand_fn =~ s/\012//g;
+			if (-f $cand_fn) {
+				# this actually was a filename
+				filter_filename_output($cand_fn, "$file_stack[0]->{str}$c");
+				# the closing delimiter likely appears at whatever later point in the stream
+				# so do not take the output off ... yet
+				$file_stack[0]->{matched} = 1;
+			} else {
+				# not a filename!
+				output_mismatched("$file_stack[0]->{str}$c");
+				shift @file_stack;
+				# keep going with the next line, which we just started
+				$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
+			}
+		} else {
+			# any other char, just add it
+			$file_stack[0]->{str} .= $c;
+		}
+	} elsif ($state == ST_IGNORE_LINE) {
+		if ($c eq "\n") {
+			# done
+			output_regular($c);
+			$state = @file_stack ? ST_IN_PARENS : ST_OUTER;
+		} else {
+			output_line_ignore($c);
+		}
+	} else {
+		die("Ended up in illegal state $state");
+	}
+}
+
+
+
+
+# none of this code handles any terminal attributes. So if the child ever sets
+# the attributes, terminal input/output may not work as intended.
+# Since *tex typically do not set that (in fact, we use a pty only so that
+# the test for "is it a terminal?" succeeds), it should work fine when wrapping
+# tex programs.
+
+my $pty = IO::Pty::Easy->new(raw => 0);
+$pty->spawn(@ARGV);
+
+my $select = IO::Select->new($pty, \*STDIN);
+
+$SIG{'INT'} = sub {
+	my ($sig) = @_;
+	$pty->kill($sig, 1);
+};
+
+ACTIVE_LOOP: while (kill(0, $pty->pid)) {
+	my @can_read = $select->can_read();
+
+	if (grep { $_ == \*STDIN } @can_read) {
+		my $nread = sysread(STDIN, my $buf, 1024);
+		if (!defined($nread)) {
+			die("Error reading from STDIN: $!");
+		}
+		if ($nread == 0) {
+			# end of file
+			$pty->write("\cD", 0);
+		} else {
+			my $chars = $pty->write($buf, 0);
+			if (defined($chars)) {
+				if ($chars == 0) {
+					last ACTIVE_LOOP;
+				} elsif ($chars < length($buf)) {
+					die("Short write to Pty");
+				}
+			}
+		}
+	}
+
+	my $output = $pty->read(0);
+	last if defined($output) && $output eq '';
+	if (defined($output)) {
+		$output =~ s/\015//g; # make \015 disappear
+		for my $c (split //, $output) {
+			eat($c);
+		}
+	}
+}
+flush_stack();
+$pty->close;
+
+my $tex_exit = ($? >> 8);
+
+# Replicate tex's exit code
+exit($tex_exit);

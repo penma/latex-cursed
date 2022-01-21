@@ -1,0 +1,64 @@
+#!/usr/bin/env perl
+use strict;
+use warnings qw(all FATAL uninitialized);
+use 5.026;
+use autodie;
+use Time::HiRes;
+
+my %saved_files; # name => { content, stat }
+my @save_exts = qw(aux out);
+
+# try to figure out the filename from commandline arguments. currently, this
+# detects if the command contains a single argument that ends with .tex. If so,
+# it assumes this to be the input filename. If not then it errs on the safe
+# side and will neither save nor recover anything.
+#
+# Note: this detection will go wrong if using e.g. -jobname
+my @fargs = grep { /\.tex$/ } @ARGV;
+if (@fargs == 1 and -f $fargs[0]) {
+	# this is probably really a .tex file. Save associated auxiliary files
+	my $fn_base = ($fargs[0] =~ s/\.\Ktex$//r);
+
+	for my $ext (@save_exts) {
+		my $extfn = $fn_base . $ext;
+		if (-f $extfn and $fargs[0] ne $extfn) {
+			my @stat = Time::HiRes::stat($extfn);
+			open(my $fh, '<', $extfn);
+			$saved_files{$extfn} = { content => do { local $/; <$fh> }, stat => \@stat };
+			close($fh);
+		}
+	}
+} else {
+	print STDERR "\e[33mWarning: unable to guess input filename from commandline arguments. Will not recover any files.\e[m\n";
+}
+
+sub restore_files {
+	for my $extfn (sort keys %saved_files) {
+		my $ext_mtime = (stat($extfn))[9];
+		if (abs($ext_mtime - time()) > 3) {
+			print STDERR "\e[31mNot recovering $extfn because it does not appear to be recently updated by a recent latex run\e[m\n";
+		} else {
+			print STDERR "\e[32mRecovering contents of $extfn\e[m\n";
+			open(my $fh, '>', $extfn);
+			print $fh $saved_files{$extfn}->{content};
+			close $fh;
+			my @stat = $saved_files{$extfn}->{stat}->@*;
+			Time::HiRes::utime($stat[8], $stat[9], $extfn) or warn("Unable to set tilestamps for $extfn: $!");
+		}
+	}
+}
+
+my $status = system { $ARGV[0] } @ARGV;
+if ($status == -1) {
+	print STDERR "\e[31mUnable to execute command @ARGV: $!\e[m\n";
+	exit(1);
+}
+
+my $tex_exit = ($status >> 8);
+
+if ($tex_exit != 0) {
+	restore_files();
+}
+
+# Replicate tex's exit code
+exit($tex_exit);
